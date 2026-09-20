@@ -1,0 +1,11 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.cache/
+data/processed/
+data/rejected/
+data/index/
+data/logs/
+
+data/backups/
