@@ -13,6 +13,8 @@ FALLBACK = {
 URLS = {
     'openai': 'https://api.openai.com/v1/chat/completions',
     'gemini': 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+    'ollama': 'http://localhost:11434/v1/chat/completions',
+
 }
 
 
@@ -50,6 +52,7 @@ class ChatClient:
 
     def _complete_once(self, messages):
         payload = {'model': self.model, 'messages': messages, 'stream': False,
+                   'temperature': 0.2,
                    'response_format': {'type':'json_object'}}
         req = request.Request(self.url, data=json.dumps(payload).encode('utf-8'),
             headers={'Content-Type':'application/json','Authorization':'Bearer '+self.key}, method='POST')
