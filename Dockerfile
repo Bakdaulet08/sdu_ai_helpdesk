@@ -1,8 +1,9 @@
-FROM golang:1.24-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 COPY cmd ./cmd
 COPY internal ./internal
+COPY go.mod go.sum ./
 RUN go build -o /out/server ./cmd/server
 
 FROM alpine:3.20

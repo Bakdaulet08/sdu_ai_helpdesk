@@ -1,1 +1,1 @@
-"""FAQ knowledge-base indexing. Run from ai_ml with python -m kb.cli."""
+"""SDU AI helpdesk: поиск по базе знаний + генерация ответа локальной LLM (Ollama)."""

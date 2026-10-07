@@ -1,101 +1,123 @@
+"""Команды:  python -m kb.cli <prepare|index|search|ask|doctor>"""
 import argparse
 import hashlib
 import json
-import os
+import logging
 from pathlib import Path
 
+from .config import ROOT, Settings, resolve_path
 from .dataset import prepare_records
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_source(path):
-    # Detect a CSV changed while it was being read.
     before = hashlib.sha256(path.read_bytes()).hexdigest()
     records, excluded, report = prepare_records(path)
     if hashlib.sha256(path.read_bytes()).hexdigest() != before:
-        raise ValueError("CSV changed during reading. Retry with a stable file.")
+        raise ValueError('CSV changed during reading. Retry with a stable file.')
     report['source_sha256'] = before
     return records, excluded, report
 
 
 def write_prepared(records, excluded, report):
-    for directory, filename, rows in [
-        ('processed','qa_clean.jsonl',records), ('rejected','faq_excluded.jsonl',excluded)]:
+    for directory, filename, rows in [('processed', 'qa_clean.jsonl', records), ('rejected', 'faq_excluded.jsonl', excluded)]:
         folder = ROOT / 'data' / directory
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / filename).write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows),encoding='utf-8')
-    (ROOT/'data/processed/index_report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+        (folder / filename).write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows), encoding='utf-8')
+    (ROOT / 'data/processed/index_report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def dump(value):
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def build_encoder(settings):
+    from .embedding import E5
+    return E5(settings.device, settings.batch_size)
+
+
+def doctor(settings):
+    """Проверка окружения: что именно мешает работать."""
+    ok = True
+
+    def line(flag, text):
+        nonlocal ok
+        ok = ok and flag
+        print(('[ OK ] ' if flag else '[FAIL] ') + text)
+
+    from .index import VectorIndex
+    try:
+        index = VectorIndex.load(resolve_path(settings.index_dir))
+        line(True, f'Индекс: {len(index)} вопросов ({settings.index_dir})')
+        meta = json.loads((resolve_path(settings.index_dir) / 'metadata.json').read_text(encoding='utf-8'))
+        csv_hash = hashlib.sha256((ROOT / 'data/raw/faq.csv').read_bytes()).hexdigest()
+        if meta.get('source_sha256') and meta['source_sha256'] != csv_hash:
+            print('[WARN] faq.csv изменился после построения индекса -> python -m kb.cli index')
+    except Exception as exc:  # noqa: BLE001
+        line(False, f'Индекс: {exc}')
+    try:
+        import sentence_transformers  # noqa: F401
+        line(True, 'sentence-transformers установлен (модель e5 скачается при первом запуске, ~1.1 ГБ)')
+    except ImportError:
+        line(False, 'sentence-transformers не установлен: pip install -r requirements.txt')
+    from .llm import make_client
+    try:
+        client = make_client(settings)
+        info = client.ping()
+        line(info['reachable'], f'{settings.llm_provider}: сервер {"доступен" if info["reachable"] else "НЕ доступен (ollama serve?)"}')
+        if info['reachable']:
+            line(info['model_available'], f'Модель {settings.llm_model} ' + ('установлена' if info['model_available']
+                 else f'не найдена. Выполните: ollama pull {settings.llm_model}'))
+    except ValueError as exc:
+        line(False, f'Настройки LLM: {exc}')
+    print('\nВсё готово к запуску.' if ok else '\nИсправьте пункты [FAIL] и запустите снова.')
+    return 0 if ok else 1
 
 
 def main():
-    parser = argparse.ArgumentParser(description='SDU FAQ indexing: CSV -> E5 -> pgvector')
-    parser.add_argument('command',choices=['prepare','init-db','index','search','retrieve','generate'])
-    parser.add_argument('--input',type=Path,default=ROOT/'data/raw/faq.csv')
-    parser.add_argument('--dataset',default='faq')
-    parser.add_argument('--local-only',action='store_true',help='Build embeddings without PostgreSQL')
+    parser = argparse.ArgumentParser(description='SDU helpdesk: база знаний + Ollama')
+    parser.add_argument('command', choices=['prepare', 'index', 'search', 'ask', 'doctor'])
+    parser.add_argument('--input', type=Path, default=ROOT / 'data/raw/faq.csv')
     parser.add_argument('--question')
-    parser.add_argument('--top-k',type=int,default=3)
-    parser.add_argument('--threshold',type=float,help='retrieve/generate; default KB_MIN_SIMILARITY or 0.80')
-    parser.add_argument('--language',choices=['ru','kk','en'],default='ru')
-    args=parser.parse_args()
-    if args.local_only and args.command!='index':parser.error('--local-only is for index only')
-    if args.threshold is not None and args.command not in {'retrieve','generate'}:parser.error('--threshold is for retrieve/generate only')
-    if args.command in {'prepare','index'}:
-        records, excluded, report=load_source(args.input)
-        write_prepared(records,excluded,report)
-        print(json.dumps(report,ensure_ascii=False,indent=2))
-        if args.command=='prepare':return
+    parser.add_argument('--language', choices=['auto', 'ru', 'kk', 'en'], default='auto')
+    parser.add_argument('--top-k', type=int, default=5)
+    args = parser.parse_args()
+
     from dotenv import load_dotenv
-    load_dotenv(ROOT/'.env')
-    url=os.getenv('KB_DATABASE_URL','')
-    if args.command=='init-db':
-        if not url:parser.error('Set KB_DATABASE_URL in ai_ml/.env')
-        from .store import init_database
-        init_database(url)
-        print('Knowledge-base tables are ready.')
+    load_dotenv(ROOT / '.env')
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
+    settings = Settings.from_env()
+
+    if args.command == 'doctor':
+        raise SystemExit(doctor(settings))
+    if args.command in {'prepare', 'index'}:
+        records, excluded, report = load_source(args.input)
+        write_prepared(records, excluded, report)
+        dump(report)
+        if args.command == 'prepare':
+            return
+        from .index import VectorIndex
+        encoder = build_encoder(settings)
+        vectors = encoder.encode([r['question'] for r in records])
+        VectorIndex.save(resolve_path(settings.index_dir), records, vectors, report['source_sha256'])
+        print(f'Индекс построен: {len(records)} вопросов.')
         return
-    if not args.local_only and not url:parser.error('Set KB_DATABASE_URL in ai_ml/.env')
-    if args.command in {'search','retrieve','generate'} and (not args.question or not args.question.strip()):parser.error('--question is required')
-    if args.command in {'retrieve','generate'}:
-        from .retrieval import validate_threshold
-        try:
-            threshold=validate_threshold(args.threshold if args.threshold is not None else os.getenv('KB_MIN_SIMILARITY','0.80'))
-        except ValueError as exc:parser.error(str(exc))
-    if args.command=='generate':
-        from .generation import ChatClient
-        try:client=ChatClient.from_env()
-        except ValueError as exc:parser.error(str(exc))
-        context_path=Path(os.getenv('KB_CONTEXT_FILE','config/university_context.txt'))
-        if not context_path.is_absolute():context_path=ROOT/context_path
-        context=context_path.read_text(encoding='utf-8')
-    if not 1 <= args.top_k <= 20:parser.error('--top-k must be between 1 and 20')
-    from .embedding import E5, MODEL, STRATEGY, DIMENSION
-    model=E5(os.getenv('KB_DEVICE','cpu'),int(os.getenv('KB_BATCH_SIZE','16')))
-    if args.command=='index':
-        import numpy as np
-        vectors=model.encode([r['question'] for r in records])
-        folder=ROOT/'data/index';folder.mkdir(parents=True,exist_ok=True)
-        np.save(folder/'embeddings.npy',vectors,allow_pickle=False)
-        (folder/'records.json').write_text(json.dumps(records,ensure_ascii=False),encoding='utf-8')
-        (folder/'metadata.json').write_text(json.dumps({**report,'model':MODEL,'strategy':STRATEGY,'dimension':DIMENSION},ensure_ascii=False,indent=2),encoding='utf-8')
-        if not args.local_only:
-            from .store import replace_dataset
-            replace_dataset(url,args.dataset,records,vectors,report['source_sha256'])
-        print(f'Created {len(records)} question embeddings of dimension {DIMENSION}. '+('Local files only.' if args.local_only else 'Committed to pgvector.'))
-    elif args.command in {'retrieve','generate'}:
-        from .retrieval import postgres_retriever
-        retriever=postgres_retriever(url,model,threshold,args.dataset)
-        if args.command=='generate':
-            from .generation import AnswerService
-            result=AnswerService(retriever,client,context).answer(args.question,args.language)
-        else:result=retriever.retrieve(args.question)
-        print(json.dumps(result,ensure_ascii=False,indent=2))
-    else:
-        from .store import search
-        result=search(url,args.dataset,model.encode([args.question],query=True)[0],args.top_k)
-        print(json.dumps(result,ensure_ascii=False,indent=2))
+
+    if not args.question or not args.question.strip():
+        parser.error('--question is required')
+    from .index import VectorIndex
+    from .retrieval import Retriever
+    index = VectorIndex.load(resolve_path(settings.index_dir))
+    encoder = build_encoder(settings)
+    retriever = Retriever(encoder, index, args.top_k if args.command == 'search' else settings.top_k, 0.0 if args.command == 'search' else settings.candidate_floor)
+    if args.command == 'search':
+        found = retriever.retrieve(args.question)
+        dump([{**c, 'answer': c['answer'][:200]} for c in found['candidates']])
+        return
+    from .generation import AnswerService
+    from .llm import make_client
+    service = AnswerService(retriever, make_client(settings), settings.read_context(), settings.source_only_min)
+    dump(service.answer(args.question, args.language))
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
