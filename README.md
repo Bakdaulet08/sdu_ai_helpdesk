@@ -330,3 +330,4 @@ in the `app-data` volume.
   plaintext dev password — use a real secret (env var from a secrets
   manager, not committed anywhere) in any shared or production
   deployment. Keep `.env` out of version control (it's gitignored).
+# go_learn
