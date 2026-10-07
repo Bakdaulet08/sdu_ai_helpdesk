@@ -3,6 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 COPY cmd ./cmd
 COPY internal ./internal
+COPY go.mod go.sum ./
 RUN go build -o /out/server ./cmd/server
 
 FROM alpine:3.20
